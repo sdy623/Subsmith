@@ -152,17 +152,21 @@ def get_word_reading_with_fugashi(word: str) -> Optional[str]:
         # 尝试多种方式获取读音
         reading = None
         
-        # 方法1: UniDic 的 kana 字段
-        if hasattr(first_token.feature, 'kana'):
+        # 方法1: UniDic 的 lForm 字段 (最准确的片假名读音)
+        if hasattr(first_token.feature, 'lForm') and first_token.feature.lForm is not None:
+            reading = first_token.feature.lForm
+        
+        # 方法2: UniDic 的 kana 字段 (备选)
+        elif hasattr(first_token.feature, 'kana') and first_token.feature.kana is not None:
             reading = first_token.feature.kana
         
-        # 方法2: 直接访问 feature 列表 (IPADic)
+        # 方法3: 直接访问 feature 列表 (IPADic)
         # IPADic: [品詞, 品詞細分類1, 品詞細分類2, 品詞細分類3, 活用型, 活用形, 原形, 読み, 発音]
-        if not reading and hasattr(first_token, 'feature') and len(first_token.feature) > 7:
+        elif hasattr(first_token, 'feature') and len(first_token.feature) > 7:
             reading = first_token.feature[7]  # 读音字段
         
-        # 方法3: 使用 features 属性
-        if not reading and hasattr(first_token, 'features'):
+        # 方法4: 使用 features 属性 (备选)
+        elif hasattr(first_token, 'features'):
             features = first_token.features
             if len(features) > 7:
                 reading = features[7]
@@ -258,12 +262,18 @@ def match_best_pitch(all_pitches: List[Tuple[str, str]], word: str) -> Tuple[str
 
 
 def extract_pitch_info_nhk_old(mdx_file: Path, word: str, return_all: bool = False) -> Tuple[Optional[str], Optional[str]] | List[Tuple[str, str]]:
-    """从旧版 NHK 提取音调信息
+    """从旧版 NHK 提取音调信息 (带 Fugashi 读音验证)
     
     旧版 NHK 使用 tune-0/tune-1/tune-2 标记音高:
     - tune-0: 低音
     - tune-1: 高音 (添加上划线)
     - tune-2: 下降音 (添加上划线,并记录下降位置)
+    
+    ⚠️  NHK 词典特殊标记处理:
+    - 鼻浊音标记 (゜): 如 カ゜ク (家具的特殊读音)
+    - 此函数会自动使用 Fugashi 的 lForm 验证读音
+    - 如果 NHK 读音与 Fugashi 不一致,自动使用 Fugashi 的标准读音
+    - 保留 NHK 的音调位置信息
     
     Args:
         mdx_file: 旧版 NHK MDX 文件路径
@@ -276,8 +286,13 @@ def extract_pitch_info_nhk_old(mdx_file: Path, word: str, return_all: bool = Fal
         如果 return_all=True:
             [(reading_with_marks, pitch_position), ...] 列表
         
-        - reading_with_marks: 带上划线标记的假名 (HTML)
+        - reading_with_marks: 带上划线标记的假名 (HTML) - 已修正为标准读音
         - pitch_position: 音调类型 [0], [1], [2] 等
+    
+    Example:
+        >>> # 家具 - NHK: カ゜ク [1] (鼻浊音) → 自动修正为: カグ [1]
+        >>> reading, pitch = extract_pitch_info_nhk_old(nhk_path, "家具")
+        >>> # reading: "カグ" (标准读音), pitch: "[1]"
     """
     if type(mdx_file) is not Path:
         mdx_file = Path(mdx_file)
@@ -355,6 +370,92 @@ def extract_pitch_info_nhk_old(mdx_file: Path, word: str, return_all: bool = Fal
             if key not in seen_readings:
                 seen_readings.add(key)
                 unique_infos.append((reading, pitch))
+        
+        # 🔧 新增: 使用 Fugashi 验证和修正读音 (处理 NHK 鼻浊音等特殊标记)
+        if unique_infos and FUGASHI_AVAILABLE:
+            verified_infos = []
+            fugashi_reading = get_word_reading_with_fugashi(word)
+            
+            if fugashi_reading:
+                # 将 Fugashi 读音转换为平假名用于比较
+                try:
+                    import jaconv
+                    fugashi_hira = jaconv.kata2hira(fugashi_reading)
+                except (ImportError, Exception):
+                    # 简单转换
+                    fugashi_hira = fugashi_reading
+                    for char in fugashi_reading:
+                        code = ord(char)
+                        if 0x30A1 <= code <= 0x30F6:
+                            fugashi_hira = fugashi_hira.replace(char, chr(code - 0x60))
+                
+                for reading_html, pitch_pos in unique_infos:
+                    # 提取纯文本读音
+                    plain_reading = re.sub(r'<[^>]+>', '', reading_html)
+                    
+                    # 移除 NHK 特殊标记 (鼻浊音 ゜、长音 ー 等)
+                    clean_reading = plain_reading.replace('゜', '').replace('◌゚', '')
+                    
+                    # 转换为平假名用于比较
+                    try:
+                        import jaconv
+                        clean_hira = jaconv.kata2hira(clean_reading)
+                    except:
+                        clean_hira = clean_reading
+                        for char in clean_reading:
+                            code = ord(char)
+                            if 0x30A1 <= code <= 0x30F6:
+                                clean_hira = clean_hira.replace(char, chr(code - 0x60))
+                    
+                    # 比较读音
+                    if clean_hira != fugashi_hira:
+                        # 读音不匹配 (如 NHK 的鼻浊音 カ゜ク vs Fugashi 的 カグ)
+                        # 使用 Fugashi 的读音，保留 NHK 的音调位置
+                        
+                        # 将 Fugashi 读音转换为片假名
+                        fugashi_kata = fugashi_reading
+                        
+                        # 根据音调位置重建 HTML
+                        # 提取音调位置数字
+                        pitch_num = 0
+                        pitch_match = re.search(r'\[(\d+)\]', pitch_pos)
+                        if pitch_match:
+                            pitch_num = int(pitch_match.group(1))
+                        
+                        # 重建带音调标记的 HTML
+                        new_reading_parts = []
+                        for i, char in enumerate(fugashi_kata):
+                            pos = i + 1
+                            
+                            if pitch_num == 0:
+                                # 平板式: 第一拍无线,第二拍开始有上划线
+                                if pos > 1:
+                                    new_reading_parts.append(f'<span style="text-decoration: overline;">{char}</span>')
+                                else:
+                                    new_reading_parts.append(char)
+                            elif pitch_num == 1:
+                                # 頭高型: 第一拍有上划线,后续无线
+                                if pos == 1:
+                                    new_reading_parts.append(f'<span style="text-decoration: overline;">{char}</span>')
+                                else:
+                                    new_reading_parts.append(char)
+                            else:
+                                # 中高型/尾高型: 第二拍到下降位置有上划线
+                                if 2 <= pos <= pitch_num:
+                                    new_reading_parts.append(f'<span style="text-decoration: overline;">{char}</span>')
+                                else:
+                                    new_reading_parts.append(char)
+                        
+                        corrected_reading_html = ''.join(new_reading_parts)
+                        verified_infos.append((corrected_reading_html, pitch_pos))
+                        
+                        # 可选: 打印警告 (调试时使用)
+                        # print(f"⚠️  NHK 读音修正: {word} - NHK:{plain_reading} → Fugashi:{fugashi_kata}")
+                    else:
+                        # 读音一致,保留原样
+                        verified_infos.append((reading_html, pitch_pos))
+                
+                unique_infos = verified_infos if verified_infos else unique_infos
         
         if return_all:
             return unique_infos

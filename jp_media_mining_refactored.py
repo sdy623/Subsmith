@@ -70,6 +70,12 @@ import requests
 from fugashi import Tagger
 
 try:
+    import jaconv
+except ImportError:
+    jaconv = None
+    print("⚠️  jaconv 未安装,将使用简单的片假名转换。建议运行: pip install jaconv")
+
+try:
     import pandas as pd
 except ImportError:
     pd = None
@@ -501,9 +507,18 @@ def cut_audio(video: Path, start: float, end: float, out_audio: Path) -> None:
 # ----------------------- 字幕和文本处理 -----------------------
 
 def katakana_to_hiragana(text: str) -> str:
-    """将片假名转换为平假名"""
+    """将片假名转换为平假名
+    
+    优先使用 jaconv 库 (更准确),如果未安装则使用简单转换
+    """
     if not text:
         return ""
+    
+    # 如果 jaconv 可用,使用它 (更准确、更完整)
+    if jaconv:
+        return jaconv.kata2hira(text)
+    
+    # 降级方案: 简单的 Unicode 转换
     result = []
     for char in text:
         code = ord(char)
@@ -746,14 +761,19 @@ def tokens_furigana(text: str, tagger: Tagger) -> str:
     out = []
     for t in tagger(text):
         surf = t.surface
-        # 获取读音(片假名)
+        # 获取读音(片假名) - 使用 lForm (发音形式)
         yomi = None
-        if hasattr(t.feature, 'kana'):
+        if hasattr(t.feature, 'lForm') and t.feature.lForm is not None:
+            # lForm 是 UniDic 的标准读音字段 (片假名)
+            yomi = t.feature.lForm
+        elif hasattr(t.feature, 'kana') and t.feature.kana is not None:
+            # 备选: kana 字段 (某些词典格式)
             yomi = t.feature.kana
         elif hasattr(t, 'feature') and len(t.feature) > 7:
+            # 备选: IPADic 数组格式 (索引 7 是读音)
             yomi = t.feature[7]
         
-        # 转换为平假名
+        # 转换为平假名 (使用 jaconv 或降级方案)
         if yomi:
             yomi = katakana_to_hiragana(yomi)
         
